@@ -59,7 +59,6 @@ python zhihuishu_exam_automation.py
 | `SKIP_COMPLETED_QUESTIONS` | 否 | 是否跳过已完成题目，默认 `true` |
 | `ENABLE_REASONING` | 否 | 是否启用推理模式，默认 `false` |
 | `EXAM_URL` | 否 | 指定考试链接（留空则运行时手动输入） |
-| `QWEN_TEMPERATURE` | 否 | 生成温度参数，默认 `0.7` |
 
 > API 密钥可前往 [阿里云百炼控制台](https://bailian.console.aliyun.com/) 申请。所有请求走标准 OpenAI Chat Completions 接口，可将 `QWEN_ENDPOINT` 和 `QWEN_API_KEY` 替换为其他兼容服务（如 DeepSeek、硅基流动等）。
 

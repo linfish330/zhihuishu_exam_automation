@@ -359,7 +359,6 @@ async def ai_answer_question(page, question_num, total_questions):
                 "content": prompt
             }
         ],
-        "temperature": 0.3,
         "extra_body": {
             "enable_search": True,
             "enable_thinking": enable_reasoning
@@ -635,8 +634,7 @@ async def get_subject_description_by_vl_ocr(page):
                             }
                         ]
                     }
-                ],
-                "temperature": 0.1
+                ]
             }
             
             headers = {
