@@ -23,3 +23,7 @@ __pycache__/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Study/exam reference materials
+reference_materials/
+

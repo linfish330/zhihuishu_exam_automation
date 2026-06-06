@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import time
+import math
 from datetime import datetime
 import httpx
 from playwright.async_api import async_playwright
@@ -9,8 +10,6 @@ from dotenv import load_dotenv
 import os
 import logging
 import base64
-
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +22,119 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+class ReferenceManager:
+    def __init__(self, dir_path=None):
+        self.dir_path = dir_path or os.getenv("REFERENCE_DIR", "reference_materials")
+        self.docs = {}          # filename -> file content
+        self.doc_words = {}     # filename -> set of tokens
+        self.idf = {}           # token -> idf score
+        self.full_context = ""  # concatenated text of all files (for 'full' mode)
+        self.load_documents()
+
+    def tokenize(self, text):
+        if not text:
+            return set()
+        text = text.lower()
+        # 寻找中文字符
+        chinese_chars = re.findall(r'[\u4e00-\u9fa5]', text)
+        # 寻找英文单词和数字
+        english_words = re.findall(r'[a-zA-Z0-9]+', text)
+        
+        tokens = set(english_words)
+        # 生成中文双字与三字组 N-gram 促进鲁棒的中文搜索
+        for i in range(len(chinese_chars) - 1):
+            tokens.add(chinese_chars[i] + chinese_chars[i+1])
+        for i in range(len(chinese_chars) - 2):
+            tokens.add(chinese_chars[i] + chinese_chars[i+1] + chinese_chars[i+2])
+            
+        return tokens
+
+    def load_documents(self):
+        if not os.path.exists(self.dir_path):
+            logger.warning(f"参考资料文件夹未找到: {self.dir_path}")
+            return
+        
+        all_tokens = []
+        full_texts = []
+        try:
+            filenames = sorted(os.listdir(self.dir_path))
+            for filename in filenames:
+                if filename.endswith('.md') or filename.endswith('.txt'):
+                    filepath = os.path.join(self.dir_path, filename)
+                    try:
+                        with open(filepath, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        self.docs[filename] = content
+                        tokens = self.tokenize(content)
+                        self.doc_words[filename] = tokens
+                        all_tokens.append(tokens)
+                        full_texts.append(f"【参考资料：{filename}】\n{content}\n")
+                    except Exception as e:
+                        logger.warning(f"读取参考文件失败 {filename}: {e}")
+            
+            self.full_context = "\n".join(full_texts)
+            
+            # 计算 IDF
+            num_docs = len(self.docs)
+            if num_docs == 0:
+                logger.warning(f"参考资料文件夹 {self.dir_path} 内未发现符合条件的 .md 或 .txt 文件")
+                return
+                
+            df = {}
+            for tokens in all_tokens:
+                for token in tokens:
+                    df[token] = df.get(token, 0) + 1
+                    
+            for token, count in df.items():
+                # 平滑的 IDF 公式
+                self.idf[token] = math.log((num_docs + 1) / (count + 0.5))
+                
+            logger.info(f"成功加载并索引了 {num_docs} 篇参考资料。总字符数: {len(self.full_context)}")
+        except Exception as e:
+            logger.error(f"加载参考资料时发生错误: {e}")
+
+    def search(self, query, top_k=3):
+        if not self.docs:
+            return []
+            
+        query_tokens = self.tokenize(query)
+        scores = {}
+        for filename, doc_tokens in self.doc_words.items():
+            score = 0
+            for token in query_tokens:
+                if token in doc_tokens:
+                    score += self.idf.get(token, 1.0)
+            if score > 0:
+                scores[filename] = score
+                
+        sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return sorted_docs[:top_k]
+
+    def get_context(self, query=None):
+        mode = os.getenv("REFERENCE_MODE", "rag").lower()
+        if mode == "none":
+            return ""
+        elif mode == "full":
+            return self.full_context
+        elif mode == "rag":
+            if not query:
+                return ""
+            top_k = int(os.getenv("REFERENCE_TOP_K", "3"))
+            results = self.search(query, top_k=top_k)
+            if not results:
+                logger.info("RAG 检索未匹配到任何相关参考资料")
+                return ""
+            
+            logger.info(f"RAG 检索完成，匹配到相关文档: {[r[0] for r in results]}")
+            retrieved_texts = []
+            for filename, score in results:
+                retrieved_texts.append(f"【参考资料：{filename} (相关度评分: {score:.2f})】\n{self.docs[filename]}")
+            return "\n\n".join(retrieved_texts)
+        else:
+            logger.warning(f"未知的 REFERENCE_MODE: {mode}，默认不加载参考资料")
+            return ""
+
 
 def _clean_thinking_process(text):
     """移除大模型可能返回的思考过程（如 <think>...</think> 或 [thinking]... 等标记）"""
@@ -71,7 +183,7 @@ async def wait_for_question_number(page, target_num, timeout=5):
     return False
 
 
-async def ai_answer_question(page, question_num, total_questions):
+async def ai_answer_question(page, question_num, total_questions, reference_manager=None):
     """处理单题：提取题干与选项，调用模型作答并推进到下一题。"""
     
     logger.info(f"开始处理第 {question_num} 题")
@@ -319,7 +431,30 @@ async def ai_answer_question(page, question_num, total_questions):
         logger.error("无法获取题目选项")
         raise Exception("无法获取题目选项")
     
-    prompt = f"""
+    # 构建参考资料检索的查询词（题干 + 所有选项内容）
+    ref_query = subject_describe
+    for letter, content, index, number_index in options:
+        ref_query += f" {content}"
+        
+    ref_context = ""
+    if reference_manager:
+        ref_context = reference_manager.get_context(ref_query)
+        
+    if ref_context:
+        prompt = f"""
+        参考资料：
+        {ref_context}
+
+        请根据以上参考资料以及给出的考试题目和选项，选择正确答案。请只返回选项的数字索引，不要返回其他内容。
+        对于单选题，返回一个数字（如1）。对于多选题，返回多个数字，用分号分隔（如1;3;4）。
+
+        题目类型: {subject_type}
+        题目描述: {subject_describe}
+        
+        选项:
+        """
+    else:
+        prompt = f"""
         请根据以下考试题目和选项，选择正确答案。请只返回选项的数字索引，不要返回其他内容。
         对于单选题，返回一个数字（如1）。对于多选题，返回多个数字，用分号分隔（如1;3;4）。
 
@@ -327,7 +462,7 @@ async def ai_answer_question(page, question_num, total_questions):
         题目描述: {subject_describe}
         
         选项:
-    """
+        """
     
     for letter, content, index, number_index in options:
         prompt += f"{number_index}. {letter}. {content}\n"
@@ -700,44 +835,52 @@ async def get_total_questions(page):
             logger.warning(f"兜底统计题目数失败，使用默认值 10: {fallback_error}")
             return 10
 
-async def process_exam(page, exam_url, username, userPassword, total_questions=None):
-    """处理单个考试：打开URL、检测登录、逐题作答。"""
-    await page.goto(exam_url)
-    logger.info("已打开考试页面")
+async def process_exam(page, exam_url, username, userPassword, total_questions=None, reference_manager=None):
+    """处理单个考试：如果提供了 URL 则打开，否则直接在当前页面检测登录并逐题作答。"""
+    if exam_url:
+        await page.goto(exam_url)
+        logger.info("已打开考试页面")
 
-    # 如果跳转后需要重新登录
-    try:
-        logger.info("等待登录页面出现...")
-        await page.wait_for_selector('input[name="username"]', timeout=10000)
-        logger.info("检测到登录页面")
-
-        print("正在输入手机号、密码")
-        logger.info("正在输入手机号...")
-        await page.fill('input[name="username"]', username)
-        logger.info("手机号已输入")
-
-        logger.info("正在输入密码...")
-        await page.fill('input[name="password"]', userPassword)
-        logger.info("密码已输入")
-
-        await asyncio.sleep(0.8)
-
-        print("正在点击登录按钮...")
-        await page.click('.wall-sub-btn')
-        logger.info("已点击登录按钮")
-        logger.info("正在等待回到考试页面...")
-        print("【请接管】请手动完成验证码输入（回到考试页面会自动进行下一步）")
-
-        await page.wait_for_selector('div.examPaper_subject.mt20', timeout=30000)
-        logger.info("已回到考试页面")
-
-    except Exception as login_probe_error:
-        logger.info(f"无需登录或已在考试页面: {login_probe_error}")
+        # 如果跳转后需要重新登录
         try:
+            logger.info("等待登录页面出现...")
+            await page.wait_for_selector('input[name="username"]', timeout=10000)
+            logger.info("检测到登录页面")
+
+            print("正在输入手机号、密码")
+            logger.info("正在输入手机号...")
+            await page.fill('input[name="username"]', username)
+            logger.info("手机号已输入")
+
+            logger.info("正在输入密码...")
+            await page.fill('input[name="password"]', userPassword)
+            logger.info("密码已输入")
+
+            await asyncio.sleep(0.8)
+
+            print("正在点击登录按钮...")
+            await page.click('.wall-sub-btn')
+            logger.info("已点击登录按钮")
+            logger.info("正在等待回到考试页面...")
+            print("【请接管】请手动完成验证码输入（回到考试页面会自动进行下一步）")
+
             await page.wait_for_selector('div.examPaper_subject.mt20', timeout=30000)
+            logger.info("已回到考试页面")
+
+        except Exception as login_probe_error:
+            logger.info(f"无需登录或已在考试页面: {login_probe_error}")
+            try:
+                await page.wait_for_selector('div.examPaper_subject.mt20', timeout=30000)
+                logger.info("检测到考试题目容器")
+            except Exception:
+                logger.warning("未检测到考试题目容器，可能页面未正确加载")
+    else:
+        logger.info("没有提供考试URL，假设用户已手动导航到考试页面")
+        try:
+            await page.wait_for_selector('div.examPaper_subject.mt20', timeout=15000)
             logger.info("检测到考试题目容器")
         except Exception:
-            logger.warning("未检测到考试题目容器，可能页面未正确加载")
+            logger.warning("未检测到考试题目容器，请确保已进入考试作答页面")
 
     await page.wait_for_load_state('domcontentloaded')
 
@@ -783,7 +926,7 @@ async def process_exam(page, exam_url, username, userPassword, total_questions=N
     for i in range(1, total_questions + 1):
         logger.info(f"开始处理第 {i} 题")
 
-        await ai_answer_question(page, i, total_questions)
+        await ai_answer_question(page, i, total_questions, reference_manager=reference_manager)
 
         await asyncio.sleep(1)
 
@@ -795,6 +938,8 @@ async def process_exam(page, exam_url, username, userPassword, total_questions=N
 
 async def zhihuishu_exam_automation():
     """考试主流程：登录、逐题调用 AI 作答，支持连续处理多个考试。"""
+    reference_manager = ReferenceManager()
+    
     env_username = os.getenv("USERNAME")
     env_password = os.getenv("PASSWORD")
 
@@ -875,22 +1020,33 @@ async def zhihuishu_exam_automation():
             logger.info("等待登录完成，继续...")
 
         # 2. 循环处理考试
+        first_run = True
         while True:
             print("\n" + "=" * 50)
 
-            exam_url = os.getenv("EXAM_URL")
-            if exam_url:
-                print(f"使用环境变量中的考试页面URL: {exam_url}")
+            exam_url = os.getenv("EXAM_URL") if first_run else None
+            
+            if exam_url and exam_url.strip():
+                print(f"检测到已配置考试URL: {exam_url}")
+                print("正在自动打开考试页面...")
+                await process_exam(page, exam_url, username, userPassword, reference_manager=reference_manager)
             else:
-                exam_url = input("请输入考试页面URL: ")
-                print(f"正在打开考试页面: {exam_url}")
+                print("【手动/输入提示】")
+                print("1. 直接在浏览器中手动打开考试答题页面，然后按回车确认开始答题。")
+                print("2. 或者在下方输入新的考试 URL 并按回车。")
+                choice = input("请输入新考试URL，或直接按回车(Enter)开始回答已手动打开的页面: ").strip()
+                if choice:
+                    print(f"正在打开考试页面: {choice}")
+                    await process_exam(page, choice, username, userPassword, reference_manager=reference_manager)
+                else:
+                    print("开始解析当前浏览器中手动打开的考试页面...")
+                    await process_exam(page, None, username, userPassword, reference_manager=reference_manager)
 
-            await process_exam(page, exam_url, username, userPassword)
-
+            first_run = False
             print("\n" + "=" * 50)
             print("【询问】是否还有下一个考试需要处理？")
             another = input("输入 y 继续，其他键退出: ").strip().lower()
-            if another != 'y' and another != 'yes' and another != '是':
+            if another not in ['y', 'yes', '是']:
                 print("程序结束，浏览器保持打开状态...")
                 break
 
