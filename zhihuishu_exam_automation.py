@@ -222,26 +222,6 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
                 current_question_num = 0
             break
     
-    is_question_completed = False
-    if current_subject:
-        completed_indicators = await current_subject.query_selector_all('span.onChecked')
-        if len(completed_indicators) > 0:
-            is_question_completed = True
-            logger.info(f"检测到第 {question_num} 题已完成")
-    
-    if is_question_completed:
-        if skip_completed_questions:
-            logger.info(f"题目已完成且设置为跳过，切换到下一题")
-            next_button = await page.query_selector('button:has-text("下一题")')
-            if next_button:
-                await next_button.click()
-                logger.info("已点击下一题按钮")
-            else:
-                logger.warning("未找到下一题按钮")
-            return
-        else:
-            logger.info(f"题目已完成但设置为重做，继续处理")
-    
     if current_question_num != question_num:
         logger.warning(f"开始处理第 {question_num} 题，但当前页面显示第 {current_question_num} 题，启动纠错机制")
         
@@ -350,7 +330,6 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
         logger.error("未找到当前显示的题目")
         return
     
-    
     subject_type_elements = await current_subject.query_selector_all('div.subject_type_annex span')
     subject_type = "未知题型"
     if subject_type_elements:
@@ -363,109 +342,193 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
     else:
         logger.warning("未找到任何题型信息")
     
+    is_fill_blank = '填空' in subject_type or '简答' in subject_type
+
+    # 检测并提取填空题/简答题的输入框
+    blank_elements = []
+    if is_fill_blank:
+        blank_elements = await current_subject.query_selector_all('textarea.text_textarea')
+        if not blank_elements:
+            blank_elements = await current_subject.query_selector_all('textarea')
+        if not blank_elements:
+            blank_elements = await current_subject.query_selector_all('input[type="text"]')
+        logger.info(f"检测到填空题，空格数: {len(blank_elements)}")
+
+    is_question_completed = False
+    if is_fill_blank:
+        # 如果是填空题，检查是否所有格子都已有内容
+        if blank_elements:
+            filled_count = 0
+            for elem in blank_elements:
+                val = await elem.input_value()
+                if val.strip():
+                    filled_count += 1
+            if len(blank_elements) > 0 and filled_count == len(blank_elements):
+                is_question_completed = True
+                logger.info(f"检测到第 {question_num} 题 (填空/简答题) 所有空格已填入内容")
+    else:
+        completed_indicators = await current_subject.query_selector_all('span.onChecked')
+        if len(completed_indicators) > 0:
+            is_question_completed = True
+            logger.info(f"检测到第 {question_num} 题已完成")
+    
+    if is_question_completed:
+        if skip_completed_questions:
+            logger.info(f"题目已完成且设置为跳过，切换到下一题")
+            next_button = await page.query_selector('button:has-text("下一题")')
+            if next_button:
+                await next_button.click()
+                logger.info("已点击下一题按钮")
+            else:
+                logger.warning("未找到下一题按钮")
+            return
+        else:
+            logger.info(f"题目已完成但设置为重做，继续处理")
+    
     subject_describe = await get_subject_description_by_vl_ocr(page)
     
     options = []
-    try:
-        option_elements = await current_subject.query_selector_all('div.nodeLab')
-        
-        for i, element in enumerate(option_elements):
-            letter_element = await element.query_selector('span.mr10, span.ABCase, span.onChecked')
-            letter_text = ""
-            if letter_element:
-                letter_text = await letter_element.inner_text()
-                letter_match = re.search(r'[A-Z]', letter_text)
-                if letter_match:
-                    letter_text = letter_match.group(0)
-                
-            content_element = await element.query_selector('div.node_detail p, div.node_detail span, div.node_detail.examquestions-answer')
-            content_text = ""
-            if content_element:
-                content_text = await content_element.inner_text()
-            else:
-                content_element = await element.query_selector('div.label div.node_detail')
+    option_elements = []
+    if not is_fill_blank:
+        try:
+            option_elements = await current_subject.query_selector_all('div.nodeLab')
+            
+            for i, element in enumerate(option_elements):
+                letter_element = await element.query_selector('span.mr10, span.ABCase, span.onChecked')
+                letter_text = ""
+                if letter_element:
+                    letter_text = await letter_element.inner_text()
+                    letter_match = re.search(r'[A-Z]', letter_text)
+                    if letter_match:
+                        letter_text = letter_match.group(0)
+                    
+                content_element = await element.query_selector('div.node_detail p, div.node_detail span, div.node_detail.examquestions-answer')
+                content_text = ""
                 if content_element:
                     content_text = await content_element.inner_text()
-            
-            # 检测图片选项作为内容兜底
-            if not content_text.strip():
-                img_element = await element.query_selector('img')
-                if img_element:
-                    img_src = await img_element.get_attribute('src')
-                    content_text = f"[图片] (URL: {img_src})"
-            
-            if letter_text and content_text:
-                options.append((letter_text, content_text, i, i+1))
-            else:
-                logger.warning(f"无法提取选项 {i+1} 的字母或内容，尝试备用方法")
+                else:
+                    content_element = await element.query_selector('div.label div.node_detail')
+                    if content_element:
+                        content_text = await content_element.inner_text()
                 
-                label_element = await element.query_selector('div.label')
-                if label_element:
-                    full_label_text = await label_element.inner_text()
-                    letter_match = re.search(r'^\s*([A-Z])\.', full_label_text)
-                    if letter_match:
-                        letter_text = letter_match.group(1)
-                        content_match = re.search(r'^\s*[A-Z]\.\s*(.+)', full_label_text)
-                        if content_match:
-                            content_text = content_match.group(1).strip()
-                
-                if not content_text.strip() and element:
+                # 检测图片选项作为内容兜底
+                if not content_text.strip():
                     img_element = await element.query_selector('img')
                     if img_element:
                         img_src = await img_element.get_attribute('src')
                         content_text = f"[图片] (URL: {img_src})"
-
+                
                 if letter_text and content_text:
                     options.append((letter_text, content_text, i, i+1))
                 else:
-                    logger.error(f"无法提取选项 {i+1} 的内容: {element}")
-                    # 使用兜底，不直接抛出异常崩溃
-                    letter_text = letter_text or chr(ord('A') + i)
-                    content_text = content_text or f"[未知选项内容 {i+1}]"
-                    options.append((letter_text, content_text, i, i+1))
-    except Exception as e:
-        logger.error(f"获取选项时出错: {e}")
-        raise Exception(f"无法获取题目选项: {e}")
+                    logger.warning(f"无法提取选项 {i+1} 的字母或内容，尝试备用方法")
+                    
+                    label_element = await element.query_selector('div.label')
+                    if label_element:
+                        full_label_text = await label_element.inner_text()
+                        letter_match = re.search(r'^\s*([A-Z])\.', full_label_text)
+                        if letter_match:
+                            letter_text = letter_match.group(1)
+                            content_match = re.search(r'^\s*[A-Z]\.\s*(.+)', full_label_text)
+                            if content_match:
+                                content_text = content_match.group(1).strip()
+                    
+                    if not content_text.strip() and element:
+                        img_element = await element.query_selector('img')
+                        if img_element:
+                            img_src = await img_element.get_attribute('src')
+                            content_text = f"[图片] (URL: {img_src})"
     
-    if not options:
-        logger.error("无法获取题目选项")
-        raise Exception("无法获取题目选项")
+                    if letter_text and content_text:
+                        options.append((letter_text, content_text, i, i+1))
+                    else:
+                        logger.error(f"无法提取选项 {i+1} 的内容: {element}")
+                        # 使用兜底，不直接抛出异常崩溃
+                        letter_text = letter_text or chr(ord('A') + i)
+                        content_text = content_text or f"[未知选项内容 {i+1}]"
+                        options.append((letter_text, content_text, i, i+1))
+        except Exception as e:
+            logger.error(f"获取选项时出错: {e}")
+            raise Exception(f"无法获取题目选项: {e}")
+        
+        if not options:
+            logger.error("无法获取题目选项")
+            raise Exception("无法获取题目选项")
     
     # 构建参考资料检索的查询词（题干 + 所有选项内容）
     ref_query = subject_describe
-    for letter, content, index, number_index in options:
-        ref_query += f" {content}"
+    if not is_fill_blank:
+        for letter, content, index, number_index in options:
+            ref_query += f" {content}"
         
     ref_context = ""
     if reference_manager:
         ref_context = reference_manager.get_context(ref_query)
         
-    if ref_context:
-        prompt = f"""
-        参考资料：
-        {ref_context}
+    if is_fill_blank:
+        num_blanks = len(blank_elements)
+        if ref_context:
+            prompt = f"""
+            参考资料：
+            {ref_context}
 
-        请根据以上参考资料以及给出的考试题目和选项，选择正确答案。请只返回选项的数字索引，不要返回其他内容。
-        对于单选题，返回一个数字（如1）。对于多选题，返回多个数字，用分号分隔（如1;3;4）。
+            请根据以上参考资料以及给出的填空/简答题题目，给出各空格的答案。
+            本题共有 {num_blanks} 个填空/输入框。
+            请直接返回一个 JSON 数组，包含 {num_blanks} 个字符串元素，分别对应各个空格的答案。
+            不要返回任何其他解释、前缀、后缀或 Markdown 代码块标记（如 ```json 等）。只返回合法的 JSON 数组本身。
 
-        题目类型: {subject_type}
-        题目描述: {subject_describe}
-        
-        选项:
-        """
+            示例（若有 2 个空格，答案分别是“北京”和“上海”，则只需返回）：
+            ["北京", "上海"]
+
+            示例（若只有 1 个输入框，答案是“中国”，则只需返回）：
+            ["中国"]
+
+            题目类型: {subject_type}
+            题目描述: {subject_describe}
+            """
+        else:
+            prompt = f"""
+            请根据给出的填空/简答题题目，给出各空格的答案。
+            本题共有 {num_blanks} 个填空/输入框。
+            请直接返回一个 JSON 数组，包含 {num_blanks} 个字符串元素，分别对应各个空格的答案。
+            不要返回任何其他解释、前缀、后缀或 Markdown 代码块标记（如 ```json 等）。只返回合法的 JSON 数组本身。
+
+            示例（若有 2 个空格，答案分别是“北京”和“上海”，则只需返回）：
+            ["北京", "上海"]
+
+            示例（若只有 1 个输入框，答案是“中国”，则只需返回）：
+            ["中国"]
+
+            题目类型: {subject_type}
+            题目描述: {subject_describe}
+            """
     else:
-        prompt = f"""
-        请根据以下考试题目和选项，选择正确答案。请只返回选项的数字索引，不要返回其他内容。
-        对于单选题，返回一个数字（如1）。对于多选题，返回多个数字，用分号分隔（如1;3;4）。
-
-        题目类型: {subject_type}
-        题目描述: {subject_describe}
-        
-        选项:
-        """
+        if ref_context:
+            prompt = f"""
+            参考资料：
+            {ref_context}
     
-    for letter, content, index, number_index in options:
-        prompt += f"{number_index}. {letter}. {content}\n"
+            请根据以上参考资料以及给出的考试题目和选项，选择正确答案。请只返回选项的数字索引，不要返回其他内容。
+            对于单选题，返回一个数字（如1）。对于多选题，返回多个数字，用分号分隔（如1;3;4）。
+    
+            题目类型: {subject_type}
+            题目描述: {subject_describe}
+            
+            选项:
+            """
+        else:
+            prompt = f"""
+            请根据以下考试题目和选项，选择正确答案。请只返回选项的数字索引，不要返回其他内容。
+            对于单选题，返回一个数字（如1）。对于多选题，返回多个数字，用分号分隔（如1;3;4）。
+    
+            题目类型: {subject_type}
+            题目描述: {subject_describe}
+            
+            选项:
+            """
+        
+        for letter, content, index, number_index in options:
+            prompt += f"{number_index}. {letter}. {content}\n"
     
     if logger.level <= logging.DEBUG:
         logger.info(f"发送给大模型的提示词: \n{prompt}")
@@ -515,52 +578,105 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
             logger.info(f"大模型返回的答案: {answer_text}")
             answer_text = _clean_thinking_process(answer_text)
             
-            indices = re.findall(r'(\d+)', answer_text)
-            unique_indices = list(dict.fromkeys([int(idx) for idx in indices if idx.isdigit()]))
-            
-            # 如果没找到有效数字索引，尝试匹配字母 A, B, C, D...
-            if not unique_indices:
-                letters = re.findall(r'\b([A-Za-z])\b', answer_text)
-                if letters:
-                    for letter in letters:
-                        # 找到字母对应的选项索引
-                        for idx, opt in enumerate(options):
-                            if opt[0].upper() == letter.upper():
-                                unique_indices.append(idx + 1)
-                                logger.info(f"解析到字母选项: {letter.upper()}，对应索引 {idx + 1}")
-
-            if not unique_indices:
-                logger.warning("没有匹配到有效的数字或字母选项索引")
-                print("【暂停答题】AI未返回有效选项，请手动处理后按回车键继续...")
-                input()
-                logger.info("用户已确认，继续答题")
-                return
-    
-            logger.info(f"解析出的选项索引: {unique_indices}")
-            
-            if not skip_completed_questions and '多选' in subject_type:
-                logger.info("重做模式下的多选题，先取消已选择的选项")
+            if is_fill_blank:
+                # 尝试解析 JSON 数组
+                answers = []
+                cleaned_text = answer_text
+                # 移除 markdown 代码块标记
+                cleaned_text = re.sub(r'```(?:json)?\s*(.*?)\s*```', r'\1', cleaned_text, flags=re.DOTALL).strip()
                 
-                # 使用标准的 CSS :has 伪类选取已选中的 nodeLab 元素，避免复杂的 XPath 向上查找
-                selected_node_labs = await current_subject.query_selector_all('div.nodeLab:has(span.flagChecked:not([style*="display: none"]))')
-                for node in selected_node_labs:
-                    await node.click()
-                    logger.info("已取消一个已选中的选项")
-            
-            for index in unique_indices:
-                array_index = index - 1
-                if 0 <= array_index < len(option_elements):
-                    target_option = option_elements[array_index]
+                # 寻找括号里面的内容 [ ... ]
+                match = re.search(r'\[\s*.*?\s*\]', cleaned_text, flags=re.DOTALL)
+                if match:
+                    json_str = match.group(0)
+                    try:
+                        parsed = json.loads(json_str)
+                        if isinstance(parsed, list):
+                            answers = [str(item) for item in parsed]
+                    except Exception:
+                        pass
+                
+                if not answers:
+                    try:
+                        parsed = json.loads(cleaned_text)
+                        if isinstance(parsed, list):
+                            answers = [str(item) for item in parsed]
+                    except Exception:
+                        pass
+                
+                # 兜底：如果没有成功解析为 list，按换行/逗号拆分，或如果是单空格直接放进去
+                if not answers:
+                    num_blanks = len(blank_elements)
+                    if num_blanks == 1:
+                        answers = [cleaned_text]
+                    else:
+                        # 尝试通过逗号或换行拆分
+                        lines = [l.strip().strip('"\'') for l in cleaned_text.split('\n') if l.strip()]
+                        answers = [l for l in lines if l]
+                
+                # 补全或截断
+                num_blanks = len(blank_elements)
+                if len(answers) < num_blanks:
+                    logger.warning(f"AI返回的答案数 ({len(answers)}) 小于题目填空格数 ({num_blanks})，补充空字符串")
+                    answers = answers + [""] * (num_blanks - len(answers))
+                elif len(answers) > num_blanks:
+                    logger.warning(f"AI返回的答案数 ({len(answers)}) 大于题目填空格数 ({num_blanks})，进行截断")
+                    answers = answers[:num_blanks]
+                
+                # 填入网页
+                for index, answer in enumerate(answers):
+                    blank_elem = blank_elements[index]
+                    await blank_elem.scroll_into_view_if_needed()
+                    await blank_elem.fill(answer)
+                    await asyncio.sleep(0.3)
+                    logger.info(f"填空处 {index + 1} 已填入: {answer}")
+            else:
+                indices = re.findall(r'(\d+)', answer_text)
+                unique_indices = list(dict.fromkeys([int(idx) for idx in indices if idx.isdigit()]))
+                
+                # 如果没找到有效数字索引，尝试匹配字母 A, B, C, D...
+                if not unique_indices:
+                    letters = re.findall(r'\b([A-Za-z])\b', answer_text)
+                    if letters:
+                        for letter in letters:
+                            # 找到字母对应的选项索引
+                            for idx, opt in enumerate(options):
+                                if opt[0].upper() == letter.upper():
+                                    unique_indices.append(idx + 1)
+                                    logger.info(f"解析到字母选项: {letter.upper()}，对应索引 {idx + 1}")
+    
+                if not unique_indices:
+                    logger.warning("没有匹配到有效的数字或字母选项索引")
+                    print("【暂停答题】AI未返回有效选项，请手动处理后按回车键继续...")
+                    input()
+                    logger.info("用户已确认，继续答题")
+                    return
+        
+                logger.info(f"解析出的选项索引: {unique_indices}")
+                
+                if not skip_completed_questions and '多选' in subject_type:
+                    logger.info("重做模式下的多选题，先取消已选择的选项")
                     
-                    await target_option.click()
-                    logger.info(f"已选择选项 {options[array_index][0]} (数字索引: {index})")
-                else:
-                    logger.warning(f"选项索引超出范围: {index}")
+                    # 使用标准的 CSS :has 伪类选取已选中的 nodeLab 元素，避免复杂的 XPath 向上查找
+                    selected_node_labs = await current_subject.query_selector_all('div.nodeLab:has(span.flagChecked:not([style*="display: none"]))')
+                    for node in selected_node_labs:
+                        await node.click()
+                        logger.info("已取消一个已选中的选项")
+                
+                for index in unique_indices:
                     array_index = index - 1
-                    if 0 <= array_index < len(options):
+                    if 0 <= array_index < len(option_elements):
                         target_option = option_elements[array_index]
+                        
                         await target_option.click()
-                        logger.info(f"已选择选项 {options[array_index][0]} (通过边界扩展，数字索引: {index})")
+                        logger.info(f"已选择选项 {options[array_index][0]} (数字索引: {index})")
+                    else:
+                        logger.warning(f"选项索引超出范围: {index}")
+                        array_index = index - 1
+                        if 0 <= array_index < len(options):
+                            target_option = option_elements[array_index]
+                            await target_option.click()
+                            logger.info(f"已选择选项 {options[array_index][0]} (通过边界扩展，数字索引: {index})")
 
             await asyncio.sleep(0.5)
             
@@ -704,6 +820,9 @@ async def get_subject_description_by_vl_ocr(page):
         
         subject_describe_elements = await current_subject.query_selector_all('div.subject_describe.dynamic-fonts')
         if not subject_describe_elements:
+            subject_describe_elements = await current_subject.query_selector_all('div.subject_describe')
+            
+        if not subject_describe_elements:
             logger.warning("未找到题目描述元素")
             return "无题目描述"
         
@@ -711,7 +830,7 @@ async def get_subject_description_by_vl_ocr(page):
         
         if subject_element:
             try:
-                await page.wait_for_selector('div.subject_describe.dynamic-fonts', state='attached')
+                await page.wait_for_selector('div.subject_describe', state='attached')
                 logger.info("题目描述元素已附加到DOM中")
             except Exception as attach_error:
                 logger.warning(f"题目描述元素未附加到DOM中: {attach_error}")
@@ -843,34 +962,41 @@ async def process_exam(page, exam_url, username, userPassword, total_questions=N
 
         # 如果跳转后需要重新登录
         try:
-            logger.info("等待登录页面出现...")
-            await page.wait_for_selector('input[name="username"]', timeout=10000)
-            logger.info("检测到登录页面")
-
-            print("正在输入手机号、密码")
-            logger.info("正在输入手机号...")
-            await page.fill('input[name="username"]', username)
-            logger.info("手机号已输入")
-
-            logger.info("正在输入密码...")
-            await page.fill('input[name="password"]', userPassword)
-            logger.info("密码已输入")
-
-            await asyncio.sleep(0.8)
-
-            print("正在点击登录按钮...")
-            await page.click('.wall-sub-btn')
-            logger.info("已点击登录按钮")
-            logger.info("正在等待回到考试页面...")
-            print("【请接管】请手动完成验证码输入（回到考试页面会自动进行下一步）")
-
-            await page.wait_for_selector('div.examPaper_subject.mt20', timeout=30000)
-            logger.info("已回到考试页面")
-
-        except Exception as login_probe_error:
-            logger.info(f"无需登录或已在考试页面: {login_probe_error}")
+            logger.info("等待页面加载（检测登录页或考试页）...")
+            
+            task_login = asyncio.create_task(page.wait_for_selector('input[name="username"]', timeout=15000))
+            task_exam = asyncio.create_task(page.wait_for_selector('div.examPaper_subject, div.subject_stem', timeout=15000))
+            
+            done, pending = await asyncio.wait(
+                [task_login, task_exam],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # 取消所有未完成的任务，避免后台报错
+            for task in pending:
+                task.cancel()
+                
+            # 判断是哪个任务先完成
+            if task_login in done:
+                logger.info("检测到登录页面，开始登录流程...")
+                print("正在输入手机号、密码")
+                await page.fill('input[name="username"]', username)
+                await page.fill('input[name="password"]', userPassword)
+                await asyncio.sleep(0.8)
+                print("正在点击登录按钮...")
+                await page.click('.wall-sub-btn')
+                logger.info("已点击登录按钮")
+                logger.info("正在等待回到考试页面...")
+                print("【请接管】请手动完成验证码输入（回到考试页面会自动进行下一步）")
+                await page.wait_for_selector('div.examPaper_subject', timeout=300000)
+                logger.info("已进入考试页面")
+            else:
+                logger.info("检测到已处于登录状态，直接进入考试页面")
+                
+        except Exception as e:
+            logger.info(f"等待页面加载出错或超时，尝试兜底检测: {e}")
             try:
-                await page.wait_for_selector('div.examPaper_subject.mt20', timeout=30000)
+                await page.wait_for_selector('div.examPaper_subject', timeout=15000)
                 logger.info("检测到考试题目容器")
             except Exception:
                 logger.warning("未检测到考试题目容器，可能页面未正确加载")
