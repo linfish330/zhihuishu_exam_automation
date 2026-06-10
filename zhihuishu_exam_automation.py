@@ -145,6 +145,10 @@ def _clean_thinking_process(text):
     text = re.sub(r'\[thinking\].*?\[/thinking\]', '', text, flags=re.DOTALL)
     return text.strip()
 
+async def async_input(prompt_msg: str = "") -> str:
+    """异步读取用户输入，避免阻塞 asyncio 事件循环"""
+    return await asyncio.get_event_loop().run_in_executor(None, input, prompt_msg)
+
 async def check_and_handle_captcha(page):
     """检测验证码弹窗；出现时提示人工处理并等待消失。"""
     try:
@@ -296,7 +300,7 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
         if current_question_num != question_num:
             logger.error(f"纠错后仍不一致，当前页面显示第 {current_question_num} 题，需要处理第 {question_num} 题")
             print("【暂停答题】题目序号不一致，请手动处理到正确题目后按回车键继续...")
-            input()
+            await async_input()
             logger.info("用户已确认，继续答题")
             
             subject_containers = await page.query_selector_all('div.examPaper_subject')
@@ -648,11 +652,17 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
                 if not unique_indices:
                     logger.warning("没有匹配到有效的数字或字母选项索引")
                     print("【暂停答题】AI未返回有效选项，请手动处理后按回车键继续...")
-                    input()
+                    await async_input()
                     logger.info("用户已确认，继续答题")
                     return
         
                 logger.info(f"解析出的选项索引: {unique_indices}")
+                
+                # 防止单选题或判断题下触发多次点击逻辑
+                is_single = '单选' in subject_type or '判断' in subject_type
+                if is_single and len(unique_indices) > 1:
+                    logger.info(f"检测到单选/判断题，仅保留第一个解析出的选项索引: {unique_indices[:1]}")
+                    unique_indices = unique_indices[:1]
                 
                 if not skip_completed_questions and '多选' in subject_type:
                     logger.info("重做模式下的多选题，先取消已选择的选项")
@@ -746,7 +756,7 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
                             logger.info(f"已完成所有题目 ({current_question_num}/{total_questions})，请手动检查并决定是否提交")
                         else:
                             print("【暂停答题】未找到下一题按钮，请手动处理后按回车键继续...")
-                            input()
+                            await async_input()
                             logger.info("用户已确认，继续答题")
                 
                 # 等待页面题号更新为下一题，防止后续迭代产生题号不一致警报
@@ -759,7 +769,7 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
     except httpx.TimeoutException:
         logger.error("请求大模型API超时，请检查网络或更换更快的模型")
         print("【暂停答题】API响应超时，请手动处理后按回车键继续...")
-        input()
+        await async_input()
         logger.info("用户已确认，继续答题")
         return
     except Exception as click_error:
@@ -793,7 +803,7 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
             logger.info(f"已完成所有题目 ({current_question_num}/{total_questions})，请手动检查并决定是否提交")
         else:
             print("【暂停答题】无法点击按钮，请手动处理后按回车键继续...")
-            input()
+            await async_input()
             logger.info("用户已确认，继续答题")
 
 async def get_subject_description_by_vl_ocr(page):
@@ -976,8 +986,11 @@ async def process_exam(page, exam_url, username, userPassword, total_questions=N
             for task in pending:
                 task.cancel()
                 
-            # 判断是哪个任务先完成
-            if task_login in done:
+            # 判断是哪个任务先完成且成功
+            login_detected = task_login in done and not task_login.cancelled() and task_login.exception() is None
+            exam_detected = task_exam in done and not task_exam.cancelled() and task_exam.exception() is None
+            
+            if login_detected:
                 logger.info("检测到登录页面，开始登录流程...")
                 print("正在输入手机号、密码")
                 await page.fill('input[name="username"]', username)
@@ -1009,6 +1022,9 @@ async def process_exam(page, exam_url, username, userPassword, total_questions=N
             logger.warning("未检测到考试题目容器，请确保已进入考试作答页面")
 
     await page.wait_for_load_state('domcontentloaded')
+
+    # 检测并处理开始考试前的验证码弹窗
+    await check_and_handle_captcha(page)
 
     try:
         exam_info_element = await page.query_selector('div.examInfo.infoList.hasNotes')
@@ -1108,8 +1124,8 @@ async def zhihuishu_exam_automation():
         userPassword = env_password
         print(f"使用环境变量配置: 用户名={username}")
     else:
-        username = input("请输入用户名(手机号): ")
-        userPassword = input("请输入密码: ")
+        username = await async_input("请输入用户名(手机号): ")
+        userPassword = await async_input("请输入密码: ")
 
     api_key = os.getenv("QWEN_API_KEY")
     if not api_key:
@@ -1194,7 +1210,7 @@ async def zhihuishu_exam_automation():
                 print("【手动/输入提示】")
                 print("1. 直接在浏览器中手动打开考试答题页面，然后按回车确认开始答题。")
                 print("2. 或者在下方输入新的考试 URL 并按回车。")
-                choice = input("请输入新考试URL，或直接按回车(Enter)开始回答已手动打开的页面: ").strip()
+                choice = (await async_input("请输入新考试URL，或直接按回车(Enter)开始回答已手动打开的页面: ")).strip()
                 if choice:
                     print(f"正在打开考试页面: {choice}")
                     await process_exam(page, choice, username, userPassword, reference_manager=reference_manager)
@@ -1205,7 +1221,7 @@ async def zhihuishu_exam_automation():
             first_run = False
             print("\n" + "=" * 50)
             print("【询问】是否还有下一个考试需要处理？")
-            another = input("输入 y 继续，其他键退出: ").strip().lower()
+            another = (await async_input("输入 y 继续，其他键退出: ")).strip().lower()
             if another not in ['y', 'yes', '是']:
                 print("程序结束，浏览器保持打开状态...")
                 break

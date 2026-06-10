@@ -123,7 +123,7 @@ python zhihuishu_exam_automation.py
 | 浏览器自动化 | Playwright | 1.40.0 |
 | LLM API | 阿里云 DashScope（通义千问） | OpenAI 兼容接口 |
 | HTTP 客户端 | httpx | 0.25.2 |
-| 图像处理 | Pillow, OpenCV, pytesseract | 截图与 OCR 辅助 |
+| 图像处理 | Pillow | 网页截图辅助 |
 | 配置管理 | python-dotenv | 1.0.0 |
 
 ---
