@@ -51,8 +51,8 @@ python zhihuishu_exam_automation.py
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `USERNAME` | 是 | 智慧树登录手机号 |
-| `PASSWORD` | 是 | 智慧树登录密码 |
+| `ZHIHUISHU_USERNAME` (或 `USERNAME`) | 是 | 智慧树登录手机号（Windows 推荐带 `ZHIHUISHU_` 前缀以避免系统变量冲突） |
+| `ZHIHUISHU_PASSWORD` (或 `PASSWORD`) | 是 | 智慧树登录密码 |
 | `QWEN_API_KEY` | 是 | 阿里云百炼 API 密钥 |
 | `QWEN_ENDPOINT` | 否 | API 端点，默认 `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions` |
 | `ANSWER_MODEL` | 否 | 答题模型名称，默认 `qwen3.6-plus` |

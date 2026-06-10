@@ -6,7 +6,7 @@ import math
 from datetime import datetime
 import httpx
 from playwright.async_api import async_playwright
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
 import os
 import logging
 import base64
@@ -1066,8 +1066,42 @@ async def zhihuishu_exam_automation():
     """考试主流程：登录、逐题调用 AI 作答，支持连续处理多个考试。"""
     reference_manager = ReferenceManager()
     
-    env_username = os.getenv("USERNAME")
-    env_password = os.getenv("PASSWORD")
+    # 优先从 .env 文件中加载配置以避免 Windows 下 USERNAME 环境变量冲突的问题
+    env_dict = dotenv_values(".env") if os.path.exists(".env") else {}
+    
+    # 尝试获取用户名（优先使用 ZHIHUISHU_USERNAME / ZH_USERNAME）
+    env_username = (
+        env_dict.get("ZHIHUISHU_USERNAME") or 
+        env_dict.get("ZH_USERNAME") or 
+        env_dict.get("USERNAME") or 
+        os.getenv("ZHIHUISHU_USERNAME") or 
+        os.getenv("ZH_USERNAME")
+    )
+    
+    # 尝试获取密码（优先使用 ZHIHUISHU_PASSWORD / ZH_PASSWORD）
+    env_password = (
+        env_dict.get("ZHIHUISHU_PASSWORD") or 
+        env_dict.get("ZH_PASSWORD") or 
+        env_dict.get("PASSWORD") or 
+        os.getenv("ZHIHUISHU_PASSWORD") or 
+        os.getenv("ZH_PASSWORD")
+    )
+    
+    # 兜底：如果用户名依然未找到，但系统环境变量中有 USERNAME
+    # 仅在 USERNAME 不等于系统当前登录用户名时使用，避免 Windows 下默认读取到系统用户名
+    if not env_username:
+        import getpass
+        try:
+            system_user = getpass.getuser()
+        except Exception:
+            system_user = None
+            
+        temp_username = os.getenv("USERNAME")
+        if temp_username and temp_username != system_user:
+            env_username = temp_username
+            
+    if not env_password:
+        env_password = os.getenv("PASSWORD")
 
     if env_username and env_password:
         username = env_username
