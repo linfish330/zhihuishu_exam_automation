@@ -170,95 +170,6 @@ async def async_input(prompt_msg: str = "") -> str:
     """异步读取用户输入，避免阻塞 asyncio 事件循环"""
     return await asyncio.get_event_loop().run_in_executor(None, input, prompt_msg)
 
-def clean_search_query(text: str) -> str:
-    if not text:
-        return ""
-    # 移除题型前缀如 【单选题】 或 [多选题]
-    text = re.sub(r'[【\[](?:单选|多选|判断|填空|简答)题?[】\]]', '', text)
-    # 移除题号如 1. 或 第1题：或 1、
-    text = re.sub(r'^\s*(?:第\s*\d+\s*[题.、\s]|\d+\s*[.、\s])\s*', '', text)
-    # 移除尾部括号、下划线及空格
-    text = re.sub(r'[\s（(_下划线_]*[）)]*\s*$', '', text)
-    return text.strip()
-
-async def perform_web_search(query: str, top_k: int = 3) -> str:
-    """联网关键词搜索：优先使用 DuckDuckGo，如失败则回退至 360 搜索"""
-    if not query:
-        return ""
-        
-    import urllib.parse
-    from bs4 import BeautifulSoup
-    
-    cleaned_query = clean_search_query(query)
-    if not cleaned_query:
-        cleaned_query = query
-        
-    logger.info(f"正在执行联网关键词搜索: '{cleaned_query}'")
-    
-    # 1. 尝试使用 DuckDuckGo
-    try:
-        url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(cleaned_query)}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(url, headers=headers)
-            if r.status_code == 200:
-                soup = BeautifulSoup(r.text, 'html.parser')
-                results = []
-                for result in soup.find_all('div', class_='result'):
-                    title_el = result.find('a', class_='result__a')
-                    snippet_el = result.find('a', class_='result__snippet')
-                    if title_el and snippet_el:
-                        results.append({
-                            'title': title_el.get_text(strip=True),
-                            'snippet': snippet_el.get_text(strip=True),
-                            'link': title_el.get('href', '')
-                        })
-                if results:
-                    logger.info(f"DuckDuckGo 检索到 {len(results)} 条结果，取前 {top_k} 条")
-                    formatted_results = []
-                    for i, res in enumerate(results[:top_k]):
-                        formatted_results.append(f"【网页搜索结果 {i+1}】\n标题: {res['title']}\n摘要: {res['snippet']}\n链接: {res['link']}")
-                    return "\n\n".join(formatted_results)
-    except Exception as e:
-        logger.warning(f"DuckDuckGo 搜索失败: {e}，将尝试 360 搜索...")
-        
-    # 2. 尝试使用 360 搜索
-    try:
-        url = f"https://www.so.com/s?q={urllib.parse.quote(cleaned_query)}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(url, headers=headers)
-            if r.status_code == 200:
-                soup = BeautifulSoup(r.text, 'html.parser')
-                results = []
-                for item in soup.find_all('li', class_='res-list'):
-                    h3 = item.find('h3')
-                    snippet_el = item.find(class_='res-list-summary') or item.find(class_='res-desc') or item.find('p')
-                    if h3 and snippet_el:
-                        title = h3.get_text(strip=True)
-                        link = h3.find('a').get('href', '') if h3.find('a') else ''
-                        snippet = snippet_el.get_text(strip=True)
-                        results.append({
-                            'title': title,
-                            'snippet': snippet,
-                            'link': link
-                        })
-                if results:
-                    logger.info(f"360 搜索检索到 {len(results)} 条结果，取前 {top_k} 条")
-                    formatted_results = []
-                    for i, res in enumerate(results[:top_k]):
-                        formatted_results.append(f"【网页搜索结果 {i+1}】\n标题: {res['title']}\n摘要: {res['snippet']}\n链接: {res['link']}")
-                    return "\n\n".join(formatted_results)
-    except Exception as e:
-        logger.warning(f"360 搜索也失败: {e}")
-        
-    logger.info("未检索到任何联网关键词搜索结果")
-    return ""
-
 async def check_and_handle_captcha(page):
     """检测验证码弹窗；出现时提示人工处理并等待消失。"""
     try:
@@ -579,31 +490,14 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
     if reference_manager:
         ref_context = reference_manager.get_context(ref_query)
         
-    web_context = ""
-    if os.getenv("ENABLE_KEYWORD_SEARCH", "true").lower() == "true":
-        try:
-            # 使用最简题干进行联网搜索
-            web_context = await perform_web_search(subject_describe)
-        except Exception as search_err:
-            logger.warning(f"联网检索时发生异常: {search_err}")
-            
-    # 合并本地 RAG 资料和联网关键词搜索结果
-    context_parts = []
-    if ref_context:
-        context_parts.append(f"【本地参考资料】\n{ref_context}")
-    if web_context:
-        context_parts.append(f"【联网网页搜索结果】\n{web_context}")
-        
-    context_str = "\n\n".join(context_parts)
-        
     if is_fill_blank:
         num_blanks = len(blank_elements)
-        if context_str:
+        if ref_context:
             prompt = f"""
-            参考背景知识：
-            {context_str}
+            参考资料：
+            {ref_context}
 
-            请根据以上参考背景知识以及给出的填空/简答题题目，给出各空格的答案。
+            请根据以上参考资料以及给出的填空/简答题题目，给出各空格的答案。
             本题共有 {num_blanks} 个填空/输入框。
             请直接返回一个 JSON 数组，包含 {num_blanks} 个字符串元素，分别对应各个空格的答案。
             不要返回任何其他解释、前缀、后缀或 Markdown 代码块标记（如 ```json 等）。只返回合法的 JSON 数组本身。
@@ -619,7 +513,7 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
             """
         else:
             prompt = f"""
-            请根据给出的填空/简答题题目，给出各空格的答案.
+            请根据给出的填空/简答题题目，给出各空格的答案。
             本题共有 {num_blanks} 个填空/输入框。
             请直接返回一个 JSON 数组，包含 {num_blanks} 个字符串元素，分别对应各个空格的答案。
             不要返回任何其他解释、前缀、后缀或 Markdown 代码块标记（如 ```json 等）。只返回合法的 JSON 数组本身。
@@ -627,19 +521,19 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
             示例（若有 2 个空格，答案分别是“北京”和“上海”，则只需返回）：
             ["北京", "上海"]
 
-            示例（若只有 1 个输入框，答案是“中国”，则只需返回）：
+            示例（若只有 1 个输入框，答案 is “中国”，则只需返回）：
             ["中国"]
 
             题目类型: {subject_type}
             题目描述: {subject_describe}
             """
     else:
-        if context_str:
+        if ref_context:
             prompt = f"""
-            参考背景知识：
-            {context_str}
+            参考资料：
+            {ref_context}
     
-            请根据以上参考背景知识以及给出的考试题目和选项，选择正确答案。请只返回选项的数字索引，不要返回其他内容。
+            请根据以上参考资料以及给出的考试题目和选项，选择正确答案。请只返回选项的数字索引，不要返回其他内容。
             对于单选题，返回一个数字（如1）。对于多选题，返回多个数字，用分号分隔（如1;3;4）。
     
             题目类型: {subject_type}
@@ -660,15 +554,15 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
         
         for letter, content, index, number_index in options:
             prompt += f"{number_index}. {letter}. {content}\n"
-    
+            
     if logger.level <= logging.DEBUG:
         logger.info(f"发送给大模型的提示词: \n{prompt}")
-    
+        
     api_key = os.getenv('QWEN_API_KEY')
     if not api_key:
         logger.error("未找到QWEN_API_KEY环境变量")
         return
-    
+        
     model_name = os.getenv('ANSWER_MODEL', os.getenv('MODEL_NAME', 'qwen3.6-plus'))
     logger.info(f"调用大模型API，模型: {model_name}")
     
@@ -679,7 +573,7 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
         url = base_endpoint
     else:
         url = f"{base_endpoint.rstrip('/')}/chat/completions"
-    
+        
     payload = {
         "model": model_name,
         "messages": [
@@ -688,8 +582,10 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
                 "content": prompt
             }
         ],
+        "stream": True,
         "extra_body": {
             "enable_search": True,
+            "search_options": {"search_strategy": "agent_max"},
             "enable_thinking": enable_reasoning
         }
     }
@@ -701,11 +597,37 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
     
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
+            answer_text = ""
+            reasoning_text = ""
             
-            result = response.json()
-            answer_text = result['choices'][0]['message']['content']
+            async with client.stream("POST", url, json=payload, headers=headers) as response:
+                response.raise_for_status()
+                
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            if 'choices' in chunk and len(chunk['choices']) > 0:
+                                delta = chunk['choices'][0].get('delta', {})
+                                
+                                # 捕获推理思考内容
+                                if 'reasoning_content' in delta and delta['reasoning_content']:
+                                    reasoning_text += delta['reasoning_content']
+                                    
+                                # 捕获普通文本内容
+                                if 'content' in delta and delta['content']:
+                                    answer_text += delta['content']
+                        except Exception:
+                            pass
+                            
+            if reasoning_text:
+                logger.info(f"大模型思考过程:\n{reasoning_text}")
             logger.info(f"大模型返回的答案: {answer_text}")
             answer_text = _clean_thinking_process(answer_text)
             
