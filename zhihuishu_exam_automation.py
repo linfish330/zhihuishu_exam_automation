@@ -208,7 +208,122 @@ async def wait_for_question_number(page, target_num, timeout=5):
     return False
 
 
-async def ai_answer_question(page, question_num, total_questions, reference_manager=None):
+async def auto_submit_exam(page):
+    """在 AUTOMODE 下自动提交考试。"""
+    logger.info("开始执行自动提交流程...")
+    await asyncio.sleep(2)  # 等待保存操作彻底完成
+    
+    # 注册一个临时对话框（Dialog）处理器，以防有浏览器原生确认弹窗
+    def handle_dialog(dialog):
+        logger.info(f"检测到系统弹窗: {dialog.message}，自动点击确定/接受")
+        dialog.accept()
+    
+    page.on("dialog", handle_dialog)
+    
+    try:
+        submit_button = None
+        submit_selectors = [
+            'button:has-text("提交试卷")',
+            'button:has-text("提交")',
+            'button:has-text("交卷")',
+            'a:has-text("提交试卷")',
+            'a:has-text("提交")',
+            'a:has-text("交卷")',
+            'span:has-text("提交试卷")',
+            'span:has-text("提交")',
+            'span:has-text("交卷")',
+        ]
+        for selector in submit_selectors:
+            try:
+                el = await page.query_selector(selector)
+                if el and await el.is_visible():
+                    submit_button = el
+                    logger.info(f"找到提交按钮，选择器为: {selector}")
+                    break
+            except Exception as e:
+                logger.debug(f"尝试通过选择器 {selector} 查找提交按钮失败: {e}")
+                
+        if not submit_button:
+            # 兜底：如果上面的标准选择器未匹配，但有类似样式的元素
+            try:
+                buttons = await page.query_selector_all('button, a, div[role="button"]')
+                for btn in buttons:
+                    text = await btn.inner_text()
+                    if any(t in text for t in ["提交试卷", "提交", "交卷"]):
+                        if await btn.is_visible():
+                            submit_button = btn
+                            logger.info(f"通过遍历元素找到提交按钮: {text}")
+                            break
+            except Exception as e:
+                logger.debug(f"遍历寻找提交按钮失败: {e}")
+                
+        if submit_button:
+            await submit_button.click()
+            logger.info("已点击提交按钮，正在等待确认弹窗出现...")
+            await asyncio.sleep(2)
+            
+            confirm_button = None
+            confirm_selectors = [
+                '.el-message-box button:has-text("确定")',
+                '.el-message-box button:has-text("确认")',
+                '.el-dialog button:has-text("确定")',
+                '.el-dialog button:has-text("确认")',
+                'button.el-button--primary:has-text("确定")',
+                'button.el-button--primary:has-text("确认")',
+                'button:has-text("确定")',
+                'button:has-text("确认")',
+                'button:has-text("确定提交")',
+                'button:has-text("确认提交")',
+                'a:has-text("确定")',
+                'a:has-text("确认")',
+                'span:has-text("确定")',
+                'span:has-text("确认")',
+            ]
+            for selector in confirm_selectors:
+                try:
+                    el = await page.query_selector(selector)
+                    if el and await el.is_visible():
+                        confirm_button = el
+                        logger.info(f"找到确认提交按钮，选择器为: {selector}")
+                        break
+                except Exception as e:
+                    logger.debug(f"尝试通过选择器 {selector} 查找确认按钮失败: {e}")
+            
+            if not confirm_button:
+                # 兜底遍历弹窗里的按钮
+                try:
+                    dialogs = await page.query_selector_all('.el-message-box, .el-dialog, [class*="dialog"], [class*="modal"]')
+                    for dialog in dialogs:
+                        if await dialog.is_visible():
+                            buttons = await dialog.query_selector_all('button, a')
+                            for btn in buttons:
+                                text = await btn.inner_text()
+                                if any(t in text for t in ["确定", "确认", "是"]):
+                                    confirm_button = btn
+                                    logger.info(f"通过弹窗遍历找到确认按钮: {text}")
+                                    break
+                            if confirm_button:
+                                break
+                except Exception as e:
+                    logger.debug(f"遍历弹窗中寻找确认按钮失败: {e}")
+            
+            if confirm_button:
+                await confirm_button.click()
+                logger.info("已点击确认按钮，提交成功！")
+                await asyncio.sleep(3)  # 等待提交网络请求完成
+            else:
+                logger.warning("未检测到确认提交的弹窗按钮，假设已直接提交。")
+        else:
+            logger.warning("在页面上未找到任何可点击的提交/交卷按钮！")
+    finally:
+        # 注销对话框事件监听器
+        try:
+            page.remove_listener("dialog", handle_dialog)
+        except Exception:
+            pass
+
+
+async def ai_answer_question(page, question_num, total_questions, reference_manager=None, automode=False):
     """处理单题：提取题干与选项，调用模型作答并推进到下一题。"""
     
     logger.info(f"开始处理第 {question_num} 题")
@@ -767,27 +882,29 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
                     break
             
             if current_question_num >= total_questions:
+                saved = False
                 next_button = await page.query_selector('button.el-button--primary.is-plain:has-text("保存")')
                 if next_button:
                     await next_button.click()
                     logger.info("已点击保存按钮（最后一题）")
-                    
-                    await asyncio.sleep(1)
-                    
-                    print("【提示】已保存，请手动检查并决定是否提交考试")
-                    logger.info("最后一题已保存，等待用户手动操作")
+                    saved = True
                 else:
                     next_button = await page.query_selector('button:has-text("保存")')
                     if next_button:
                         await next_button.click()
                         logger.info("已点击保存按钮（最后一题）")
-                        
-                        await asyncio.sleep(1)
-                        
-                        print("【提示】最后一题已保存，请手动检查并决定是否提交考试")
-                        logger.info("最后一题已保存，等待用户手动操作")
+                        saved = True
                     else:
                         logger.warning("未找到保存按钮")
+                
+                if saved:
+                    await asyncio.sleep(1)
+                    if automode:
+                        logger.info("在 AUTOMODE 模式下，准备自动提交考试...")
+                        await auto_submit_exam(page)
+                    else:
+                        print("【提示】已保存，请手动检查并决定是否提交考试")
+                        logger.info("最后一题已保存，等待用户手动操作")
             else:
                 next_button = await page.query_selector('button.el-button--primary.is-plain:has-text("下一题")')
                 if next_button:
@@ -1013,7 +1130,7 @@ async def get_total_questions(page):
             logger.warning(f"兜底统计题目数失败，使用默认值 10: {fallback_error}")
             return 10
 
-async def process_exam(page, exam_url, username, userPassword, total_questions=None, reference_manager=None):
+async def process_exam(page, exam_url, username, userPassword, total_questions=None, reference_manager=None, automode=False):
     """处理单个考试：如果提供了 URL 则打开，否则直接在当前页面检测登录并逐题作答。"""
     if exam_url:
         await page.goto(exam_url)
@@ -1116,9 +1233,7 @@ async def process_exam(page, exam_url, username, userPassword, total_questions=N
 
     for i in range(1, total_questions + 1):
         logger.info(f"开始处理第 {i} 题")
-
-        await ai_answer_question(page, i, total_questions, reference_manager=reference_manager)
-
+        await ai_answer_question(page, i, total_questions, reference_manager=reference_manager, automode=automode)
         await asyncio.sleep(1)
 
     logger.info("所有题目处理完成")
@@ -1187,6 +1302,14 @@ async def zhihuishu_exam_automation():
 
     use_ai_answer = True
 
+    automode_val = env_dict.get("AUTOMODE") or os.getenv("AUTOMODE")
+    if automode_val is None:
+        print("是否开启全自动考试模式（Automode）？该模式会自动寻找指定课程的'作业考试'并依次完成所有未做完的考试。")
+        automode_choice = (await async_input("开启请输入 y，不开启直接按回车: ")).strip().lower()
+        automode = automode_choice in ['y', 'yes', '是']
+    else:
+        automode = automode_val.strip().lower() == "true"
+
     async with async_playwright() as p:
         try:
             browser = await p.chromium.launch(
@@ -1243,6 +1366,131 @@ async def zhihuishu_exam_automation():
             # 也可能跳转到其他页面
             await asyncio.sleep(5)
             logger.info("等待登录完成，继续...")
+
+        if automode:
+            course_name = env_dict.get("COURSE_NAME") or os.getenv("COURSE_NAME")
+            if not course_name:
+                print("错误: 开启 Automode 需要配置 COURSE_NAME 环境变量或在 .env 中设置 COURSE_NAME")
+                course_name = (await async_input("请输入需要答题的课程名称: ")).strip()
+            
+            if course_name:
+                print(f"已开启全自动模式 (Automode)。正在定位课程 [{course_name}] 的 '作业考试' 页面...")
+                # Go to learning home page if not there
+                current_url = page.url
+                if "onlinestuh5" not in current_url:
+                    logger.info("正在跳转到课程列表页面...")
+                    await page.goto('https://onlineweb.zhihuishu.com/onlinestuh5')
+                    await page.wait_for_load_state('domcontentloaded')
+                
+                # XPath to find '作业考试' under COURSE_NAME
+                course_xpath = f"//div[contains(@class, 'hoverList') and .//*[contains(text(), '{course_name}')]]//span[contains(text(), '作业考试')]"
+                
+                try:
+                    btn = page.locator(course_xpath)
+                    await btn.first.wait_for(state="visible", timeout=20000)
+                except Exception as e:
+                    logger.error(f"未找到课程 [{course_name}] 的 '作业考试' 按钮: {e}")
+                    course_titles = await page.locator(".courseName, .course-name, h3, h4").all_inner_texts()
+                    logger.info(f"页面上的候选标题/元素文本: {course_titles}")
+                    print("【错误】未能在课程列表中找到指定的课程。请确认课程名称拼写完全一致。")
+                    return
+
+                exam_list_page = None
+                try:
+                    async with context.expect_page(timeout=8000) as new_page_info:
+                        await page.locator(course_xpath).first.click()
+                    exam_list_page = await new_page_info.value
+                    logger.info("已在新标签页中打开作业考试列表")
+                except Exception:
+                    logger.info("未检测到新标签页，假定在当前页面中导航...")
+                    await page.locator(course_xpath).first.click()
+                    exam_list_page = page
+
+                await exam_list_page.wait_for_load_state('domcontentloaded')
+                
+                # Check slider / captcha on exam list page
+                logger.info("检测是否有验证码/安全验证，请在浏览器中手动完成...")
+                print("【提示】如果页面出现滑动验证码或其他安全验证，请在浏览器中手动完成。")
+                try:
+                    await exam_list_page.wait_for_selector('a.jobExamComBtn', timeout=15000)
+                    logger.info("成功加载作业考试列表")
+                except Exception:
+                    logger.warning("未检测到作业考试列表，可能需要手动完成验证码。")
+                    await async_input("完成验证后请在此处按回车(Enter)键继续...")
+
+                # Loop through all incomplete exams
+                while True:
+                    await exam_list_page.wait_for_load_state('domcontentloaded')
+                    buttons = exam_list_page.locator("a.jobExamComBtn:has-text('开始答题'), a.jobExamComBtn:has-text('继续答题')")
+                    count = await buttons.count()
+                    logger.info(f"检测到 {count} 个未完成的考试/作业")
+                    
+                    if count == 0:
+                         print("\n【完成】当前课程下所有考试已处理完毕！")
+                         break
+                         
+                    first_btn = buttons.first
+                    exam_title = "未知考试"
+                    try:
+                        li_element = exam_list_page.locator("li:has(a.jobExamComBtn)").filter(has=first_btn).first
+                        title_el = li_element.locator("span.name.middle")
+                        exam_title = (await title_el.inner_text()).strip()
+                    except Exception as e:
+                        logger.warning(f"获取考试标题失败: {e}")
+                        
+                    logger.info(f"开始处理考试: {exam_title}")
+                    print(f"\n开始自动处理考试: {exam_title}")
+                    
+                    exam_page = None
+                    try:
+                        async with context.expect_page(timeout=8000) as exam_page_info:
+                            await first_btn.click()
+                        exam_page = await exam_page_info.value
+                        logger.info(f"已在新标签页中打开考试: {exam_title}")
+                    except Exception:
+                        logger.info(f"未检测到新标签页，在当前标签页中导航...")
+                        await first_btn.click()
+                        exam_page = exam_list_page
+                        
+                    await exam_page.wait_for_load_state('domcontentloaded')
+                    
+                    # Process the exam
+                    try:
+                        await process_exam(
+                            page=exam_page,
+                            exam_url=None,
+                            username=username,
+                            userPassword=userPassword,
+                            reference_manager=reference_manager,
+                            automode=True
+                        )
+                    except Exception as exam_err:
+                        logger.error(f"处理考试 [{exam_title}] 时出错: {exam_err}")
+                        print(f"【警告】考试 [{exam_title}] 处理失败: {exam_err}")
+                        print("请确认页面状态。按回车键继续下一个考试...")
+                        await async_input()
+                        
+                    if exam_page != exam_list_page:
+                        logger.info(f"关闭考试页面: {exam_title}")
+                        await exam_page.close()
+                        
+                    await asyncio.sleep(3)
+                    
+                    if exam_list_page != page:
+                        logger.info("正在刷新考试列表以更新状态...")
+                        await exam_list_page.reload()
+                        await exam_list_page.wait_for_load_state('domcontentloaded')
+                        try:
+                            # 必须等待 AJAX 列表数据加载完毕并渲染出按钮，防止页面在没有按钮渲染出来前直接读取 count=0
+                            await exam_list_page.wait_for_selector('a.jobExamComBtn', timeout=10000)
+                        except Exception:
+                            # 如果没有找到任何按钮，说明可能全做完了，延时 2 秒作为安全缓冲
+                            await asyncio.sleep(2)
+                
+                print("全自动答题流程结束，浏览器保持打开状态。")
+                print("按回车键退出程序并关闭浏览器...")
+                await async_input()
+                return
 
         # 2. 循环处理考试
         first_run = True
