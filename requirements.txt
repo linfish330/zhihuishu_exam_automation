@@ -1,4 +1,4 @@
 playwright==1.40.0
 python-dotenv==1.0.0
-httpx==0.25.2
+httpx[http2]==0.27.0
 Pillow==10.1.0

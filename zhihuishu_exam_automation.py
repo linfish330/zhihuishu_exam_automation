@@ -25,9 +25,17 @@ load_dotenv()
 
 class ReferenceManager:
     def __init__(self, dir_path=None):
-        self.dir_path = dir_path or os.getenv("REFERENCE_DIR", "reference_materials")
-        self.docs = {}          # filename -> file content
-        self.doc_words = {}     # filename -> set of tokens
+        self.dir_paths = []
+        env_dir = dir_path or os.getenv("REFERENCE_DIR", "reference_materials")
+        if env_dir:
+            self.dir_paths.append(env_dir)
+        
+        # 自动将根目录下的 "markdown" 目录也纳入扫描范围（若存在且未在列表中）
+        if os.path.exists("markdown") and "markdown" not in self.dir_paths:
+            self.dir_paths.append("markdown")
+            
+        self.docs = {}          # filepath_key -> file content
+        self.doc_words = {}     # filepath_key -> set of tokens
         self.idf = {}           # token -> idf score
         self.full_context = ""  # concatenated text of all files (for 'full' mode)
         self.load_documents()
@@ -51,48 +59,61 @@ class ReferenceManager:
         return tokens
 
     def load_documents(self):
-        if not os.path.exists(self.dir_path):
-            logger.warning(f"参考资料文件夹未找到: {self.dir_path}")
-            return
-        
         all_tokens = []
         full_texts = []
-        try:
-            filenames = sorted(os.listdir(self.dir_path))
-            for filename in filenames:
-                if filename.endswith('.md') or filename.endswith('.txt'):
-                    filepath = os.path.join(self.dir_path, filename)
-                    try:
-                        with open(filepath, 'r', encoding='utf-8') as f:
-                            content = f.read()
-                        self.docs[filename] = content
-                        tokens = self.tokenize(content)
-                        self.doc_words[filename] = tokens
-                        all_tokens.append(tokens)
-                        full_texts.append(f"【参考资料：{filename}】\n{content}\n")
-                    except Exception as e:
-                        logger.warning(f"读取参考文件失败 {filename}: {e}")
+        loaded_filepaths = set()
+        
+        for dir_path in self.dir_paths:
+            if not os.path.exists(dir_path):
+                continue
             
-            self.full_context = "\n".join(full_texts)
+            logger.info(f"正在扫描参考资料目录: {dir_path}")
             
-            # 计算 IDF
-            num_docs = len(self.docs)
-            if num_docs == 0:
-                logger.warning(f"参考资料文件夹 {self.dir_path} 内未发现符合条件的 .md 或 .txt 文件")
-                return
+            try:
+                # 递归遍历目录
+                for root, dirs, files in os.walk(dir_path):
+                    files.sort()
+                    for filename in files:
+                        if filename.endswith('.md') or filename.endswith('.txt'):
+                            filepath = os.path.abspath(os.path.join(root, filename))
+                            if filepath in loaded_filepaths:
+                                continue
+                            
+                            # 使用相对于当前工作目录的路径作为唯一的文档 Key，避免重名冲突并在日志中清晰展示
+                            rel_path = os.path.relpath(filepath, os.getcwd())
+                            
+                            try:
+                                with open(filepath, 'r', encoding='utf-8') as f:
+                                    content = f.read()
+                                self.docs[rel_path] = content
+                                tokens = self.tokenize(content)
+                                self.doc_words[rel_path] = tokens
+                                all_tokens.append(tokens)
+                                full_texts.append(f"【参考资料：{rel_path}】\n{content}\n")
+                                loaded_filepaths.add(filepath)
+                            except Exception as e:
+                                logger.warning(f"读取参考文件失败 {rel_path}: {e}")
+            except Exception as e:
+                logger.error(f"加载参考资料目录 {dir_path} 时发生错误: {e}")
                 
-            df = {}
-            for tokens in all_tokens:
-                for token in tokens:
-                    df[token] = df.get(token, 0) + 1
-                    
-            for token, count in df.items():
-                # 平滑的 IDF 公式
-                self.idf[token] = math.log((num_docs + 1) / (count + 0.5))
+        self.full_context = "\n".join(full_texts)
+        
+        # 计算 IDF
+        num_docs = len(self.docs)
+        if num_docs == 0:
+            logger.warning(f"所有扫描的参考资料目录 {self.dir_paths} 中均未发现符合条件的 .md 或 .txt 文件")
+            return
+            
+        df = {}
+        for tokens in all_tokens:
+            for token in tokens:
+                df[token] = df.get(token, 0) + 1
                 
-            logger.info(f"成功加载并索引了 {num_docs} 篇参考资料。总字符数: {len(self.full_context)}")
-        except Exception as e:
-            logger.error(f"加载参考资料时发生错误: {e}")
+        for token, count in df.items():
+            # 平滑的 IDF 公式
+            self.idf[token] = math.log((num_docs + 1) / (count + 0.5))
+            
+        logger.info(f"成功加载并索引了 {num_docs} 篇参考资料。总字符数: {len(self.full_context)}")
 
     def search(self, query, top_k=3):
         if not self.docs:
@@ -1207,16 +1228,18 @@ async def zhihuishu_exam_automation():
                 print("正在自动打开考试页面...")
                 await process_exam(page, exam_url, username, userPassword, reference_manager=reference_manager)
             else:
-                print("【手动/输入提示】")
-                print("1. 直接在浏览器中手动打开考试答题页面，然后按回车确认开始答题。")
-                print("2. 或者在下方输入新的考试 URL 并按回车。")
-                choice = (await async_input("请输入新考试URL，或直接按回车(Enter)开始回答已手动打开的页面: ")).strip()
-                if choice:
-                    print(f"正在打开考试页面: {choice}")
-                    await process_exam(page, choice, username, userPassword, reference_manager=reference_manager)
-                else:
-                    print("开始解析当前浏览器中手动打开的考试页面...")
-                    await process_exam(page, None, username, userPassword, reference_manager=reference_manager)
+                while True:
+                    print("【输入提示】")
+                    choice = (await async_input("请输入考试 URL 并按回车(Enter)开始答题: ")).strip()
+                    if choice:
+                        if choice.startswith("http://") or choice.startswith("https://"):
+                            print(f"正在打开考试页面: {choice}")
+                            await process_exam(page, choice, username, userPassword, reference_manager=reference_manager)
+                            break
+                        else:
+                            print("错误: 请输入以 http:// 或 https:// 开头的有效 URL 链接！\n")
+                    else:
+                        print("错误: 考试 URL 不能为空，请输入有效的考试 URL 链接！\n")
 
             first_run = False
             print("\n" + "=" * 50)
