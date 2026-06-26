@@ -135,26 +135,27 @@ class ReferenceManager:
     def get_context(self, query=None):
         mode = os.getenv("REFERENCE_MODE", "rag").lower()
         if mode == "none":
-            return ""
+            return "", 0.0
         elif mode == "full":
-            return self.full_context
+            return self.full_context, 999.0
         elif mode == "rag":
             if not query:
-                return ""
+                return "", 0.0
             top_k = int(os.getenv("REFERENCE_TOP_K", "3"))
             results = self.search(query, top_k=top_k)
             if not results:
                 logger.info("RAG 检索未匹配到任何相关参考资料")
-                return ""
+                return "", 0.0
             
             logger.info(f"RAG 检索完成，匹配到相关文档: {[r[0] for r in results]}")
             retrieved_texts = []
+            max_score = results[0][1]
             for filename, score in results:
                 retrieved_texts.append(f"【参考资料：{filename} (相关度评分: {score:.2f})】\n{self.docs[filename]}")
-            return "\n\n".join(retrieved_texts)
+            return "\n\n".join(retrieved_texts), max_score
         else:
             logger.warning(f"未知的 REFERENCE_MODE: {mode}，默认不加载参考资料")
-            return ""
+            return "", 0.0
 
 
 def _clean_thinking_process(text):
@@ -602,8 +603,30 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
             ref_query += f" {content}"
         
     ref_context = ""
+    max_score = 0.0
     if reference_manager:
-        ref_context = reference_manager.get_context(ref_query)
+        ref_context, max_score = reference_manager.get_context(ref_query)
+        
+    search_instruction = ""
+    # 从环境变量读取高匹配度得分阈值，默认为 5.0
+    rag_threshold = float(os.getenv("RAG_HIGH_MATCH_THRESHOLD", "5.0"))
+    if max_score < rag_threshold:
+        if max_score == 0:
+            logger.info("RAG 检索未匹配到任何相关参考资料，将强烈鼓励大模型调用联网搜索工具")
+            rag_status = "本地参考资料库（RAG）未检索到任何匹配的信息。"
+        else:
+            logger.info(f"RAG 检索最大匹配评分仅为 {max_score:.2f} (低于高匹配阈值 {rag_threshold})，将强烈鼓励大模型调用联网搜索工具")
+            rag_status = f"虽然本地参考资料库匹配到了相关文档，但最大相关度评分较低（仅为 {max_score:.2f}），可能与本题关联性不强或不够准确。"
+            
+        search_instruction = f"""
+            【联网搜索提示】
+            当前状态：{rag_status}
+            为了确保答题的百分之百准确，建议你**必须且主动**使用你所拥有的内置 `web_search`（联网搜索）和 `web_extractor`（网页内容抓取）工具在互联网上检索本题的正确答案及解析。
+            步骤指引：
+            1. 请以本题的题干和选项内容作为关键词运行 `web_search` 进行搜索。
+            2. 如果搜索结果包含提供该题解析、考试标准答案的第三方网页链接，请通过 `web_extractor` 抓取并对比页面内容。
+            3. 在获取并验证高可信度的互联网内容后，再给出最终答案。
+        """
         
     if is_fill_blank:
         num_blanks = len(blank_elements)
@@ -611,8 +634,10 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
             prompt = f"""
             参考资料：
             {ref_context}
+            {search_instruction}
 
             请根据以上参考资料以及给出的填空/简答题题目，给出各空格的答案。
+            （注：如果包含上面的【联网搜索提示】，请以你联网搜索/抓取网页获得的最新、最准确答案为准）。
             本题共有 {num_blanks} 个填空/输入框。
             请直接返回一个 JSON 数组，包含 {num_blanks} 个字符串元素，分别对应各个空格的答案。
             不要返回任何其他解释、前缀、后缀或 Markdown 代码块标记（如 ```json 等）。只返回合法的 JSON 数组本身。
@@ -628,7 +653,10 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
             """
         else:
             prompt = f"""
+            {search_instruction}
+
             请根据给出的填空/简答题题目，给出各空格的答案。
+            （注：如果包含上面的【联网搜索提示】，请务必执行联网搜索/抓取网页以获取正确答案）。
             本题共有 {num_blanks} 个填空/输入框。
             请直接返回一个 JSON 数组，包含 {num_blanks} 个字符串元素，分别对应各个空格的答案。
             不要返回任何其他解释、前缀、后缀或 Markdown 代码块标记（如 ```json 等）。只返回合法的 JSON 数组本身。
@@ -636,7 +664,7 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
             示例（若有 2 个空格，答案分别是“北京”和“上海”，则只需返回）：
             ["北京", "上海"]
 
-            示例（若只有 1 个输入框，答案 is “中国”，则只需返回）：
+            示例（若只有 1 个输入框，答案是“中国”，则只需返回）：
             ["中国"]
 
             题目类型: {subject_type}
@@ -647,8 +675,10 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
             prompt = f"""
             参考资料：
             {ref_context}
+            {search_instruction}
     
             请根据以上参考资料以及给出的考试题目和选项，选择正确答案。请只返回选项的数字索引，不要返回其他内容。
+            （注：如果包含上面的【联网搜索提示】，请以你联网搜索/抓取网页获得的最新、最准确答案为准）。
             对于单选题，返回一个数字（如1）。对于多选题，返回多个数字，用分号分隔（如1;3;4）。
     
             题目类型: {subject_type}
@@ -658,7 +688,10 @@ async def ai_answer_question(page, question_num, total_questions, reference_mana
             """
         else:
             prompt = f"""
+            {search_instruction}
+    
             请根据以下考试题目和选项，选择正确答案。请只返回选项的数字索引，不要返回其他内容。
+            （注：如果包含上面的【联网搜索提示】，请务必执行联网搜索/抓取网页以获取正确答案）。
             对于单选题，返回一个数字（如1）。对于多选题，返回多个数字，用分号分隔（如1;3;4）。
     
             题目类型: {subject_type}

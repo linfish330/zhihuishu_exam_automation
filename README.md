@@ -93,6 +93,7 @@ python zhihuishu_exam_automation.py
 | **参考检索** | `REFERENCE_DIR` | 否 | 参考资料/知识库总文件夹路径，默认为 `reference_materials` |
 | | `REFERENCE_MODE` | 否 | 参考资料检索模式：`rag`（基于题干智能检索，推荐）、`full`（全部导入）、`none`（不导入） |
 | | `REFERENCE_TOP_K` | 否 | RAG 检索返回的相关文档数量上限，默认 `3` |
+| | `RAG_HIGH_MATCH_THRESHOLD` | 否 | RAG 检索最大相关性得分阈值。低于该值（或未命中文档）时会强烈建议并引导大模型使用联网工具（`web_search` 和 `web_extractor`）进行比对验证，默认 `5.0` |
 | **答题控制** | `SKIP_COMPLETED_QUESTIONS`| 否 | 是否跳过已经做完的题目，默认 `true` |
 | | `ENABLE_REASONING` | 否 | 是否启用大模型推理模式，默认 `false` |
 | | `EXAM_URL` | 否 | 指定直接跳转的考试 URL（为空则运行时手动输入或直接回车解析当前页面） |
@@ -114,6 +115,7 @@ python zhihuishu_exam_automation.py
 * 启用了大模型自带的联网搜索 (`enable_search: True`)。
 * 并在 `search_options` 参数中指定了 `"search_strategy": "agent_max"` 网页抓取策略。
 * 结合流式 SSE 协议 (`stream: True`) 获取实时的联网检索和思考过程（`reasoning_content`）。这允许模型不仅可以在网上检索，还能主动访问并提取搜索结果中相关网页的完整内容进行分析决策，大幅提升了答题精度。
+* **低度匹配/未命中时自动触发联网指引**：当本地 RAG 检索的最大匹配得分低于阈值 `RAG_HIGH_MATCH_THRESHOLD`（默认 `5.0`）或未命中文档时，程序会在 Prompt 中自动注入**【联网搜索提示】**。明确指引并鼓励大模型主动调用其内置的 `web_search` 搜索题目，并使用 `web_extractor` 抓取相关解析网页，与本地资料比对，保证答题正确率。
 
 ---
 
